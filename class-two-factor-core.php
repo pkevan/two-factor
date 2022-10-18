@@ -36,6 +36,13 @@ class Two_Factor_Core {
 	const USER_META_NONCE_KEY = '_two_factor_nonce';
 
 	/**
+	 * The user meta key for tracking failed 2nd-factor authentication attempts.
+	 *
+	 * @type string
+	 */
+	const USER_META_FAILED_ATTEMPTS_KEY = '_two_factor_failed_attempts';
+
+	/**
 	 * URL query paramater used for our custom actions.
 	 *
 	 * @var string
@@ -58,13 +65,34 @@ class Two_Factor_Core {
 	private static $password_auth_tokens = array();
 
 	/**
+	 * The maximum number of failed attempts on a 2nd factor before the user's password will be
+	 * reset.
+	 *
+	 * @var int
+	 */
+	private static $failed_attempt_limit;
+
+	/**
 	 * Set up filters and actions.
 	 *
-	 * @param object $compat A compaitbility later for plugins.
+	 * @param object $compat A compatibility layer for plugins.
 	 *
 	 * @since 0.1-dev
 	 */
 	public static function add_hooks( $compat ) {
+		/**
+		 * Filters the maximum number of failed attempts on a 2nd factor before the user's
+		 * password will be reset. After a reasonable number of attempts, it's safe to assume
+		 * that the password been compromised and an attacker is trying to brute force the 2nd
+		 * factor.
+		 *
+		 * ⚠️ Many 2nd factors -- like TOTP and backup codes -- can be brute-forced in a matter
+		 * of days, so disabling this is strongly discouraged.
+		 *
+		 * @param int $limit The number of attempts before the password is reset.
+		 */
+		self::$failed_attempt_limit = apply_filters( 'two_factor_failed_attempt_limit', 7 );
+
 		add_action( 'plugins_loaded', array( __CLASS__, 'load_textdomain' ) );
 		add_action( 'init', array( __CLASS__, 'get_providers' ) );
 		add_action( 'wp_login', array( __CLASS__, 'wp_login' ), 10, 2 );
@@ -855,6 +883,9 @@ class Two_Factor_Core {
 
 		// Ask the provider to verify the second factor.
 		if ( true !== $provider->validate_authentication( $user ) ) {
+			$failed_attempts = self::bump_failed_attempts( $user->ID );
+			self::maybe_reset_password( $failed_attempts, $user );
+
 			do_action( 'wp_login_failed', $user->user_login, new WP_Error( 'two_factor_invalid', __( 'ERROR: Invalid verification code.', 'two-factor' ) ) );
 
 			$login_nonce = self::create_login_nonce( $user->ID );
@@ -866,6 +897,7 @@ class Two_Factor_Core {
 			exit;
 		}
 
+		delete_user_meta( $user->ID, self::USER_META_FAILED_ATTEMPTS_KEY );
 		self::delete_login_nonce( $user->ID );
 
 		$rememberme = false;
@@ -906,6 +938,138 @@ class Two_Factor_Core {
 		wp_safe_redirect( $redirect_to );
 
 		exit;
+	}
+
+	/**
+	 * Increase the number of failed attempts tracked for the user.
+	 *
+	 * @param int $user_id The ID of the user who failed to login.
+	 *
+	 * @return int
+	 */
+	public static function bump_failed_attempts( $user_id ) {
+		$failed_attempts = (int) get_user_meta( $user_id, self::USER_META_FAILED_ATTEMPTS_KEY, true );
+
+		update_user_meta( $user_id, self::USER_META_FAILED_ATTEMPTS_KEY, ++$failed_attempts );
+
+		return $failed_attempts;
+	}
+
+	/**
+	 * Reset the account password if the attempt limit has been passed.
+	 *
+	 * @param int     $failed_attempts The number of failed attempts
+	 * @param WP_User $user            The user who failed to login
+	 */
+	public static function maybe_reset_password( $failed_attempts, $user ) {
+		if ( $failed_attempts <= self::$failed_attempt_limit ) {
+			return;
+		}
+
+		self::reset_compromised_password( $user );
+		self::delete_login_nonce( $user->ID );
+		delete_user_meta( $user->ID, self::USER_META_FAILED_ATTEMPTS_KEY );
+
+		$error = new WP_Error(
+			'too_many_attempts', '
+			<p>
+				There have been too many failed two-factor authentication attempts, which often indicates that the password has been compromised. The password has been reset in order to protect the account.
+			</p>
+
+			<p style="margin-top: 1em;">
+				If you are the owner of this account, please check your email for instructions on regaining access.
+			</p>'
+		);
+
+		login_header( __( 'Password Reset', 'two-factor' ), '',  $error );
+		login_footer();
+		exit;
+	}
+
+	/**
+	 * Reset a user's compromised password and send notifications.
+	 *
+	 * @param WP_User $user The user whose password should be reset
+	 */
+	public static function reset_compromised_password( $user ) {
+		// Unhook because `wp_password_change_notification()` wouldn't notify the site admin when
+		// their password is compromised.
+		remove_action( 'after_password_reset', 'wp_password_change_notification' );
+		reset_password( $user, wp_generate_password( 25 ) );
+		add_action( 'after_password_reset', 'wp_password_change_notification' );
+
+		self::notify_user_password_reset( $user );
+
+		/**
+		 * Filters whether or not to email the site admin when a user's password has been
+		 * compromised and reset.
+		 *
+		 * @param bool $reset `true` to notify the admin, `false` to not notify them.
+		 */
+		$notify_admin = apply_filters( 'two_factor_notify_admin_user_password_reset', true );
+		$admin_email  = get_option( 'admin_email' );
+
+		if ( $user->user_email !== $admin_email && $notify_admin ) {
+			self::notify_admin_user_password_reset( $user );
+		}
+	}
+
+	/**
+	 * Notify the user that their password has been compromised and reset.
+	 *
+	 * @param WP_User $user The user to notify
+	 *
+	 * @return bool `true` if the email was sent, `false` if it failed.
+	 */
+	public static function notify_user_password_reset( $user ) {
+		$user_message = sprintf(
+			'Hello %1$s, an unusually high number of failed login attempts have been detected on your account at %2$s.
+
+			These attempts successfully entered your password, and were only blocked because they failed to enter your second authentication factor. Despite not being able to access your account, this behavior indicates that the attackers have compromised your password. The most common reasons for this are that your password was easy to guess, or was reused on another site which has been compromised.
+
+			To protect your account, your password has been reset, and you will need to create a new one. For advice on setting a strong password, please read %3$s
+
+			To pick a new password, please visit %4$s
+
+			This is an automated notification. If you would like to speak to a site administrator, please contact them directly.',
+			esc_html( $user->user_login ),
+			home_url(),
+			'https://wordpress.org/support/article/password-best-practices/',
+			esc_url( add_query_arg( 'action', 'lostpassword', wp_login_url() ) ),
+		);
+		$user_message = str_replace( "\t", '', $user_message );
+
+		return wp_mail( $user->user_email, 'Your password was compromised and has been reset', $user_message );
+	}
+
+	/**
+	 * Notify the admin that a user's password was compromised and reset.
+	 *
+	 * @param WP_User $user The user whose password was reset.
+	 *
+	 * @return bool `true` if the email was sent, `false` if it failed.
+	 */
+	public static function notify_admin_user_password_reset( $user ) {
+		$admin_email = get_option( 'admin_email' );
+		$subject     = sprintf( 'Compromised password for %s has been reset', esc_html( $user->user_login ) );
+
+		$message = sprintf(
+			'Hello, this is a notice from the Two Factor plugin to inform you that an unusually high number of failed login attempts have been detected on the %1$s account (ID %2$d).
+
+			Those attempts successfully entered the user\'s password, and were only blocked because they entered invalid second authentication factors.
+
+			To protect their account, the password has automatically been reset, and they have been notified that they will need to create a new one.
+
+			If you do not wish to receive these notifications, you can disable them with the `two_factor_notify_admin_password_reset` filter. See %3$s for more information.
+
+			Thank you',
+			esc_html( $user->user_login ),
+			$user->ID,
+			'https://developer.wordpress.org/plugins/hooks/'
+		);
+		$message = str_replace( "\t", '', $message );
+
+		return wp_mail( $admin_email, $subject, $message );
 	}
 
 	/**
