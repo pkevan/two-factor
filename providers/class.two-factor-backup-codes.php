@@ -13,6 +13,8 @@ class Two_Factor_Backup_Codes extends Two_Factor_Provider {
 	 * @type string
 	 */
 	const BACKUP_CODES_META_KEY = '_two_factor_backup_codes';
+	
+	const BACKUP_CODES_DOWNLOADED = '_two_factor_backup_codes_downloaded';
 
 	/**
 	 * The number backup codes.
@@ -43,6 +45,7 @@ class Two_Factor_Backup_Codes extends Two_Factor_Provider {
 		add_action( 'two-factor-user-options-' . __CLASS__, array( $this, 'user_options' ) );
 		add_action( 'admin_notices', array( $this, 'admin_notices' ) );
 		add_action( 'wp_ajax_two_factor_backup_codes_generate', array( $this, 'ajax_generate_json' ) );
+		add_action( 'wp_ajax_two_factor_backup_codes_confirm', array( $this, 'ajax_confirm_download' ) );
 
 		return parent::__construct();
 	}
@@ -113,6 +116,11 @@ class Two_Factor_Backup_Codes extends Two_Factor_Provider {
 	 * @param WP_User $user WP_User object of the logged-in user.
 	 */
 	public function user_options( $user ) {
+		// force $user if outside of profile
+		if ( empty( $user ) ) {
+			$user = wp_get_current_user();
+		}
+
 		$ajax_nonce = wp_create_nonce( 'two-factor-backup-codes-generate-json-' . $user->ID );
 		$count = self::codes_remaining_for_user( $user );
 		?>
@@ -123,8 +131,15 @@ class Two_Factor_Backup_Codes extends Two_Factor_Provider {
 			<span class="two-factor-backup-codes-count"><?php echo esc_html( sprintf( _n( '%s unused code remaining.', '%s unused codes remaining.', $count ), $count ) ); ?></span>
 		</p>
 		<div class="two-factor-backup-codes-wrapper" style="display:none;">
-			<ol class="two-factor-backup-codes-unused-codes"></ol>
+			<p class="two-factor-backup-codes-unused-codes"></p>
 			<p class="description"><?php esc_html_e( 'Write these down!  Once you navigate away from this page, you will not be able to view these codes again.' ); ?></p>
+			<a href="" class="two-factor-backup-codes-download hide-if-no-js" download="codes.txt">
+				<?php esc_html_e( 'Download Verification Codes' ); ?>
+			</a>
+			<button type="button" class="button button-two-factor-backup-codes-confirm button-secondary hide-if-no-js">
+				<?php esc_html_e( 'Backup codes downloaded' ); ?>
+			</button>
+			<p class="two-factor-backup-codes-confirm-message" style="display:none">Backup codes confirmed</p>
 		</div>
 		<script type="text/javascript">
 			jQuery( document ).ready( function( $ ) {
@@ -144,11 +159,32 @@ class Two_Factor_Backup_Codes extends Two_Factor_Provider {
 
 							// Append the codes.
 							$.each( response.data.codes, function( key, val ) {
-								$( '.two-factor-backup-codes-unused-codes' ).append( '<li>' + val + '</li>' );
+								$( '.two-factor-backup-codes-unused-codes' ).append( val + '<br />\n' );
 							} );
 
 							// Update counter.
 							$( '.two-factor-backup-codes-count' ).html( response.data.i18n );
+						}
+					} );
+				} );
+
+				$( '.two-factor-backup-codes-download' ).click( function() {
+					var codes = $( '.two-factor-backup-codes-unused-codes').text().replace( '<br />', '\n' );
+					this.href = "data:text/plain;charset=UTF-8,"  + encodeURIComponent(codes);
+				} );
+
+				$( '.button-two-factor-backup-codes-confirm' ).click( function() {
+					$.ajax( {
+						method: 'POST',
+						url: ajaxurl,
+						data: {
+							action: 'two_factor_backup_codes_confirm',
+							user_id: '<?php echo esc_js( $user->ID ); ?>',
+							nonce: '<?php echo esc_js( $ajax_nonce ); ?>'
+						},
+						dataType: 'JSON',
+						success: function( response ) {
+							$( '.two-factor-backup-codes-confirm-message' ).show();
 						}
 					} );
 				} );
@@ -190,6 +226,9 @@ class Two_Factor_Backup_Codes extends Two_Factor_Provider {
 
 		update_user_meta( $user->ID, self::BACKUP_CODES_META_KEY, $codes_hashed );
 
+		// Remove previous confirmations since new codes have been generated
+		delete_user_meta( $user->ID, self::BACKUP_CODES_DOWNLOADED );
+
 		// Unhashed.
 		return $codes;
 	}
@@ -211,6 +250,21 @@ class Two_Factor_Backup_Codes extends Two_Factor_Provider {
 		// Send the response.
 		wp_send_json_success( array( 'codes' => $codes, 'i18n' => $i18n ) );
 	}
+
+
+        /**
+         * Save confirmation that backup codes were downloaded/saved.
+         *
+         * @since 0.1-dev
+         */
+        public function ajax_confirm_download() {
+                $user = get_user_by( 'id', sanitize_text_field( $_POST['user_id'] ) );
+                check_ajax_referer( 'two-factor-backup-codes-generate-json-' . $user->ID, 'nonce' );
+
+		update_user_meta( $user->ID, self::BACKUP_CODES_DOWNLOADED, 1 ); 
+                // Send the response.
+                wp_send_json_success( true );
+        }
 
 	/**
 	 * Returns the number of unused codes for the specified user
